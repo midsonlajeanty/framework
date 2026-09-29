@@ -746,6 +746,30 @@ class RoutingUrlGeneratorTest extends TestCase
         $url->route('not_exists_route');
     }
 
+    public function testRouteParametersContainingPercentSignsAreEncoded()
+    {
+        $url = new UrlGenerator(
+            $routes = new RouteCollection,
+            $request = Request::create('http://www.foo.com/')
+        );
+
+        $routes->add(new Route(['GET'], 'foo/{bar}', ['as' => 'foo', function () {
+            //
+        }]));
+
+        // A raw percent sign would be decoded again when the router matches the URL,
+        // so the parameter has to survive a round trip through rawurldecode()...
+        $this->assertSame('http://www.foo.com/foo/%2566oo', $url->route('foo', ['bar' => '%66oo']));
+        $this->assertSame('http://www.foo.com/foo/100%25', $url->route('foo', ['bar' => '100%']));
+
+        $this->assertSame('%66oo', rawurldecode('%2566oo'));
+        $this->assertSame('100%', rawurldecode('100%25'));
+
+        // Values without a percent sign are unaffected...
+        $this->assertSame('http://www.foo.com/foo/bar', $url->route('foo', ['bar' => 'bar']));
+        $this->assertSame('http://www.foo.com/foo/1', $url->route('foo', ['bar' => 1]));
+    }
+
     public function testSignedUrl()
     {
         $url = new UrlGenerator(
@@ -774,6 +798,66 @@ class RoutingUrlGeneratorTest extends TestCase
         $this->assertTrue($url->hasValidSignature($request, ignoreQuery: ['tampered']));
 
         $this->assertTrue($url->hasValidSignature($request, ignoreQuery: fn ($parameter) => $parameter === 'tampered'));
+    }
+
+    public function testSignedUrlWithArraySignatureReturnsFalseWithoutWarning()
+    {
+        $url = new UrlGenerator(
+            $routes = new RouteCollection,
+            Request::create('http://www.foo.com/')
+        );
+        $url->setKeyResolver(function () {
+            return 'secret';
+        });
+
+        $route = new Route(['GET'], 'foo', ['as' => 'foo', function () {
+            //
+        }]);
+        $routes->add($route);
+
+        // ?signature[]=foo&signature[]=bar previously raised an
+        // "Array to string conversion" warning.
+        $request = Request::create('http://www.foo.com/foo?signature[]=foo&signature[]=bar');
+
+        set_error_handler(static function (int $errno, string $errstr) {
+            throw new \ErrorException($errstr, 0, $errno);
+        }, E_WARNING);
+
+        try {
+            $this->assertFalse($url->hasValidSignature($request));
+        } finally {
+            restore_error_handler();
+        }
+    }
+
+    public function testSignedUrlDoesNotTrustForwardedPrefixToChangeThePathBeingVerified()
+    {
+        $url = new UrlGenerator(
+            $routes = new RouteCollection,
+            Request::create('http://www.foo.com/')
+        );
+        $url->setKeyResolver(fn () => 'secret');
+
+        $routes->add(new Route(['GET'], 'document/{document}', ['as' => 'document.show', function () {
+            //
+        }]));
+
+        $signedUrl = $url->signedRoute('document.show', ['document' => 1]);
+
+        $request = Request::create(
+            'http://www.foo.com/admin/42?'.parse_url($signedUrl, PHP_URL_QUERY),
+            'GET', [], [], [], [
+                'REMOTE_ADDR' => '127.0.0.1',
+                'HTTP_X_FORWARDED_PREFIX' => '/document/1?',
+            ]
+        );
+        $request::setTrustedProxies(['127.0.0.1'], Request::HEADER_X_FORWARDED_PREFIX);
+
+        try {
+            $this->assertFalse($url->hasValidSignature($request));
+        } finally {
+            $request::setTrustedProxies([], Request::HEADER_X_FORWARDED_PREFIX);
+        }
     }
 
     public function testSignedUrlImplicitModelBinding()

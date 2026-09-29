@@ -10,7 +10,6 @@ use Foo\Bar\EloquentModelNamespacedStub;
 use Illuminate\Contracts\Database\Eloquent\Castable;
 use Illuminate\Contracts\Database\Eloquent\CastsAttributes;
 use Illuminate\Contracts\Database\Eloquent\CastsInboundAttributes;
-use Illuminate\Contracts\Encryption\Encrypter;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Database\Connection;
 use Illuminate\Database\ConnectionResolverInterface;
@@ -26,8 +25,10 @@ use Illuminate\Database\Eloquent\Casts\AsEncryptedArrayObject;
 use Illuminate\Database\Eloquent\Casts\AsEncryptedCollection;
 use Illuminate\Database\Eloquent\Casts\AsEnumArrayObject;
 use Illuminate\Database\Eloquent\Casts\AsEnumCollection;
+use Illuminate\Database\Eloquent\Casts\AsFluent;
 use Illuminate\Database\Eloquent\Casts\AsHtmlString;
 use Illuminate\Database\Eloquent\Casts\AsStringable;
+use Illuminate\Database\Eloquent\Casts\AsUri;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Concerns\HasUlids;
@@ -45,16 +46,21 @@ use Illuminate\Database\Query\Grammars\Grammar;
 use Illuminate\Database\Query\Processors\Processor;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection as BaseCollection;
-use Illuminate\Support\Facades\Crypt;
+use Illuminate\Support\Fluent;
 use Illuminate\Support\HtmlString;
 use Illuminate\Support\InteractsWithTime;
 use Illuminate\Support\Stringable;
+use Illuminate\Support\Uri;
+use Illuminate\Tests\Database\stubs\TestCast;
+use Illuminate\Tests\Database\stubs\TestValueObject;
 use InvalidArgumentException;
 use LogicException;
 use Mockery as m;
+use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
 use ReflectionClass;
 use stdClass;
+use Stringable as NativeStringable;
 
 include_once 'Enums.php';
 
@@ -66,13 +72,12 @@ class DatabaseEloquentModelTest extends TestCase
 
     protected function tearDown(): void
     {
-        parent::tearDown();
-
-        m::close();
         Carbon::setTestNow(null);
 
         Model::unsetEventDispatcher();
         Carbon::resetToStringFormat();
+
+        parent::tearDown();
     }
 
     public function testAttributeManipulation()
@@ -282,6 +287,48 @@ class DatabaseEloquentModelTest extends TestCase
 
         $model->asHtmlStringAttribute = new Stringable('<div>foo baz</div>');
         $this->assertTrue($model->isDirty('asHtmlStringAttribute'));
+    }
+
+    public function testDirtyOnCastedUri()
+    {
+        $model = new EloquentModelCastingStub;
+        $model->setRawAttributes([
+            'asUriAttribute' => 'https://www.example.com:1234?query=param&another=value',
+        ]);
+        $model->syncOriginal();
+
+        $this->assertInstanceOf(Uri::class, $model->asUriAttribute);
+        $this->assertFalse($model->isDirty('asUriAttribute'));
+
+        $model->asUriAttribute = new Uri('https://www.example.com:1234?query=param&another=value');
+        $this->assertFalse($model->isDirty('asUriAttribute'));
+
+        $model->asUriAttribute = new Uri('https://www.updated.com:1234?query=param&another=value');
+        $this->assertTrue($model->isDirty('asUriAttribute'));
+    }
+
+    public function testDirtyOnCastedFluent()
+    {
+        $value = [
+            'address' => [
+                'street' => 'test_street',
+                'city' => 'test_city',
+            ],
+        ];
+
+        $model = new EloquentModelCastingStub;
+        $model->setRawAttributes(['asFluentAttribute' => json_encode($value)]);
+        $model->syncOriginal();
+
+        $this->assertInstanceOf(Fluent::class, $model->asFluentAttribute);
+        $this->assertFalse($model->isDirty('asFluentAttribute'));
+
+        $model->asFluentAttribute = new Fluent($value);
+        $this->assertFalse($model->isDirty('asFluentAttribute'));
+
+        $value['address']['street'] = 'updated_street';
+        $model->asFluentAttribute = new Fluent($value);
+        $this->assertTrue($model->isDirty('asFluentAttribute'));
     }
 
     // public function testDirtyOnCastedEncryptedCollection()
@@ -1270,6 +1317,23 @@ class DatabaseEloquentModelTest extends TestCase
         $this->assertSame('bar', $model->getConnection());
     }
 
+    #[TestWith(['Foo'])]
+    #[TestWith([ConnectionName::Foo])]
+    #[TestWith([ConnectionNameBacked::Foo])]
+    public function testConnectionEnums(string|\UnitEnum $connectionName)
+    {
+        EloquentModelStub::setConnectionResolver($resolver = m::mock(ConnectionResolverInterface::class));
+        $model = new EloquentModelStub;
+
+        $retval = $model->setConnection($connectionName);
+        $this->assertEquals($retval, $model);
+        $this->assertSame('Foo', $model->getConnectionName());
+
+        $resolver->shouldReceive('connection')->once()->with('Foo')->andReturn('bar');
+
+        $this->assertSame('bar', $model->getConnection());
+    }
+
     public function testToArray()
     {
         $model = new EloquentModelStub;
@@ -1449,6 +1513,18 @@ class DatabaseEloquentModelTest extends TestCase
         $this->assertArrayNotHasKey('age', $array);
     }
 
+    public function testMergeHiddenMergesHidden()
+    {
+        $model = new EloquentModelHiddenStub;
+
+        $hiddenCount = count($model->getHidden());
+        $this->assertContains('foo', $model->getHidden());
+
+        $model->mergeHidden(['bar']);
+        $this->assertCount($hiddenCount + 1, $model->getHidden());
+        $this->assertContains('bar', $model->getHidden());
+    }
+
     public function testVisible()
     {
         $model = new EloquentModelStub(['name' => 'foo', 'age' => 'bar', 'id' => 'baz']);
@@ -1456,6 +1532,18 @@ class DatabaseEloquentModelTest extends TestCase
         $array = $model->toArray();
         $this->assertArrayHasKey('name', $array);
         $this->assertArrayNotHasKey('age', $array);
+    }
+
+    public function testMergeVisibleMergesVisible()
+    {
+        $model = new EloquentModelVisibleStub;
+
+        $visibleCount = count($model->getVisible());
+        $this->assertContains('foo', $model->getVisible());
+
+        $model->mergeVisible(['bar']);
+        $this->assertCount($visibleCount + 1, $model->getVisible());
+        $this->assertContains('bar', $model->getVisible());
     }
 
     public function testDynamicHidden()
@@ -1654,6 +1742,27 @@ class DatabaseEloquentModelTest extends TestCase
         $model->fill(['Foo' => 'bar']);
 
         Model::preventSilentlyDiscardingAttributes(false);
+    }
+
+    public function testGuardedWithFillableConfig(): void
+    {
+        $model = new EloquentModelStub;
+        $model::unguard();
+
+        EloquentModelStub::setConnectionResolver($resolver = m::mock(Resolver::class));
+        $resolver->shouldReceive('connection')->andReturn($connection = m::mock(stdClass::class));
+        $connection->shouldReceive('getSchemaBuilder->getColumnListing')->andReturn(['name', 'age', 'foo']);
+
+        $model->guard([]);
+        $model->fillable(['name']);
+        $model->fill(['name' => 'Leto Atreides', 'age' => 51]);
+
+        self::assertSame(
+            ['name' => 'Leto Atreides', 'age' => 51],
+            $model->getAttributes(),
+        );
+
+        $model::reguard();
     }
 
     public function testUsesOverriddenHandlerWhenDiscardingAttributes()
@@ -2354,6 +2463,46 @@ class DatabaseEloquentModelTest extends TestCase
         $this->assertEquals([], $model->toArray());
     }
 
+    public function testMergeAppendsMergesAppends()
+    {
+        $model = new EloquentModelAppendsStub;
+
+        $appendsCount = count($model->getAppends());
+        $this->assertEquals(['is_admin', 'camelCased', 'StudlyCased'], $model->getAppends());
+
+        $model->mergeAppends(['bar']);
+        $this->assertCount($appendsCount + 1, $model->getAppends());
+        $this->assertContains('bar', $model->getAppends());
+    }
+
+    public function testHasAppendedReturnsTrueWhenAttributeIsAppended()
+    {
+        $model = new EloquentModelAppendsStub;
+
+        $this->assertTrue($model->hasAppended('is_admin'));
+        $this->assertTrue($model->hasAppended('camelCased'));
+        $this->assertTrue($model->hasAppended('StudlyCased'));
+    }
+
+    public function testHasAppendedReturnsFalseWhenAttributeIsNotAppended()
+    {
+        $model = new EloquentModelAppendsStub;
+
+        $this->assertFalse($model->hasAppended('foo'));
+        $this->assertFalse($model->hasAppended('bar'));
+    }
+
+    public function testWithoutAppendsRemovesAppends()
+    {
+        $model = new EloquentModelAppendsStub;
+
+        $this->assertEquals(['is_admin', 'camelCased', 'StudlyCased'], $model->getAppends());
+
+        $model->withoutAppends();
+
+        $this->assertEmpty($model->getAppends());
+    }
+
     public function testGetMutatedAttributes()
     {
         $model = new EloquentModelGetMutatorsStub;
@@ -2777,6 +2926,17 @@ class DatabaseEloquentModelTest extends TestCase
         $this->assertEquals($model->getCasts()['bar'], 'MyClass:myArgumentA,myArgumentB');
     }
 
+    public function testUnsetCastAttributes()
+    {
+        $model = new EloquentModelCastingStub;
+        $model->asToObjectCast = TestValueObject::make([
+            'myPropertyA' => 'A',
+            'myPropertyB' => 'B',
+        ]);
+        unset($model->asToObjectCast);
+        $this->assertArrayNotHasKey('asToObjectCast', $model->getAttributes());
+    }
+
     public function testUpdatingNonExistentModelFails()
     {
         $model = new EloquentModelStub;
@@ -3095,6 +3255,20 @@ class DatabaseEloquentModelTest extends TestCase
         });
     }
 
+    public function testTouchMethodWithMultipleAttributes()
+    {
+        Carbon::setTestNow($now = Carbon::now());
+
+        $model = m::mock(EloquentModelStub::class.'[save]');
+        $model->shouldReceive('save')->once()->andReturn(true);
+
+        $result = $model->touch(['published_at', 'verified_at']);
+
+        $this->assertTrue($result);
+        $this->assertEquals($now->toDateTimeString(), $model->published_at->toDateTimeString());
+        $this->assertEquals($now->toDateTimeString(), $model->verified_at->toDateTimeString());
+    }
+
     public function testTouchingModelWithTimestamps()
     {
         $this->assertFalse(
@@ -3236,6 +3410,37 @@ class DatabaseEloquentModelTest extends TestCase
         $this->assertEquals(['bar' => 'foo'], $model->getAttribute('singleElementInArrayAttribute')->toArray());
     }
 
+    public function testUsingStringableObjectCastUsesStringRepresentation()
+    {
+        $model = new EloquentModelCastingStub;
+
+        $this->assertEquals('int', $model->getCasts()['castStringableObject']);
+    }
+
+    public function testMergeingStringableObjectCastUSesStringRepresentation()
+    {
+        $stringable = new StringableCastBuilder();
+        $stringable->cast = 'test';
+
+        $model = (new EloquentModelCastingStub)->mergeCasts([
+            'something' => $stringable,
+        ]);
+
+        $this->assertEquals('test', $model->getCasts()['something']);
+    }
+
+    public function testUsingPlainObjectAsCastThrowsException()
+    {
+        $model = new EloquentModelCastingStub;
+
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessage('The cast object for the something attribute must implement Stringable.');
+
+        $model->mergeCasts([
+            'something' => (object) [],
+        ]);
+    }
+
     public function testUnsavedModel()
     {
         $user = new UnsavedModel;
@@ -3261,6 +3466,21 @@ class DatabaseEloquentModelTest extends TestCase
         $this->assertNull($user->getAttribute('name'));
     }
 
+    public function testDiscardChangesWithCasts()
+    {
+        $model = new EloquentModelWithPrimitiveCasts();
+
+        $model->address_line_one = '123 Main Street';
+
+        $this->assertEquals('123 Main Street', $model->address->lineOne);
+        $this->assertEquals('123 MAIN STREET', $model->address_in_caps);
+
+        $model->discardChanges();
+
+        $this->assertNull($model->address->lineOne);
+        $this->assertNull($model->address_in_caps);
+    }
+
     public function testHasAttribute()
     {
         $user = new EloquentModelStub([
@@ -3283,6 +3503,23 @@ class DatabaseEloquentModelTest extends TestCase
         $this->assertTrue(json_last_error() !== JSON_ERROR_NONE);
 
         $this->assertSame('{"name":"Mateus"}', $user->toJson(JSON_THROW_ON_ERROR));
+    }
+
+    public function testModelToPrettyJson(): void
+    {
+        $user = new EloquentModelStub(['name' => 'Mateus', 'active' => true, 'number' => '123']);
+        $results = $user->toPrettyJson();
+        $expected = $user->toJson(JSON_PRETTY_PRINT);
+
+        $this->assertJsonStringEqualsJsonString($expected, $results);
+        $this->assertSame($expected, $results);
+        $this->assertStringContainsString("\n", $results);
+        $this->assertStringContainsString('    ', $results);
+
+        $results = $user->toPrettyJson(JSON_NUMERIC_CHECK);
+        $this->assertStringContainsString("\n", $results);
+        $this->assertStringContainsString('    ', $results);
+        $this->assertStringContainsString('"number": 123', $results);
     }
 
     public function testFillableWithMutators()
@@ -3330,6 +3567,39 @@ class DatabaseEloquentModelTest extends TestCase
         $this->assertEquals(EloquentModelWithUseFactoryAttribute::class, $factory->modelName());
         $this->assertEquals('test name', $instance->name); // Small smoke test to ensure the factory is working
     }
+
+    public function testUseCustomBuilderWithUseEloquentBuilderAttribute()
+    {
+        $model = new EloquentModelWithUseEloquentBuilderAttributeStub();
+
+        $query = $this->createMock(\Illuminate\Database\Query\Builder::class);
+        $eloquentBuilder = $model->newEloquentBuilder($query);
+
+        $this->assertInstanceOf(CustomBuilder::class, $eloquentBuilder);
+    }
+
+    public function testDefaultBuilderIsUsedWhenUseEloquentBuilderAttributeIsNotPresent()
+    {
+        $model = new EloquentModelWithoutUseEloquentBuilderAttributeStub();
+
+        $query = $this->createMock(\Illuminate\Database\Query\Builder::class);
+        $eloquentBuilder = $model->newEloquentBuilder($query);
+
+        $this->assertNotInstanceOf(CustomBuilder::class, $eloquentBuilder);
+    }
+}
+
+class CustomBuilder extends Builder
+{
+}
+
+#[\Illuminate\Database\Eloquent\Attributes\UseEloquentBuilder(CustomBuilder::class)]
+class EloquentModelWithUseEloquentBuilderAttributeStub extends Model
+{
+}
+
+class EloquentModelWithoutUseEloquentBuilderAttributeStub extends Model
+{
 }
 
 class EloquentTestObserverStub
@@ -3733,6 +4003,8 @@ class EloquentModelCastingStub extends Model
             'asarrayobjectAttribute' => AsArrayObject::class,
             'asStringableAttribute' => AsStringable::class,
             'asHtmlStringAttribute' => AsHtmlString::class,
+            'asUriAttribute' => AsUri::class,
+            'asFluentAttribute' => AsFluent::class,
             'asCustomCollectionAttribute' => AsCollection::using(CustomCollection::class),
             'asEncryptedArrayObjectAttribute' => AsEncryptedArrayObject::class,
             'asEncryptedCustomCollectionAttribute' => AsEncryptedCollection::using(CustomCollection::class),
@@ -3741,6 +4013,8 @@ class EloquentModelCastingStub extends Model
             'asCustomEnumArrayObjectAttribute' => AsEnumArrayObject::of(StringStatus::class),
             'singleElementInArrayAttribute' => [AsCollection::class],
             'duplicatedAttribute' => 'int',
+            'asToObjectCast' => TestCast::class,
+            'castStringableObject' => new StringableCastBuilder(),
         ];
     }
 
@@ -3774,6 +4048,18 @@ class EloquentModelDynamicHiddenStub extends Model
     {
         return ['age', 'id'];
     }
+}
+
+class EloquentModelVisibleStub extends Model
+{
+    protected $table = 'stub';
+    protected $visible = ['foo'];
+}
+
+class EloquentModelHiddenStub extends Model
+{
+    protected $table = 'stub';
+    protected $hidden = ['foo'];
 }
 
 class EloquentModelDynamicVisibleStub extends Model
@@ -3973,6 +4259,17 @@ class EloquentModelWithPrimitiveCasts extends Model
     {
         return Attribute::get(fn () => 'ok');
     }
+
+    public function addressInCaps(): Attribute
+    {
+        return Attribute::get(
+            function () {
+                $value = $this->getAttributes()['address_line_one'] ?? null;
+
+                return is_string($value) ? strtoupper($value) : $value;
+            }
+        )->shouldCache();
+    }
 }
 
 enum CastableBackedEnum: string
@@ -3982,6 +4279,12 @@ enum CastableBackedEnum: string
 
 class Address implements Castable
 {
+    public function __construct(
+        public ?string $lineOne = null,
+        public ?string $lineTwo = null
+    ) {
+    }
+
     public static function castUsing(array $arguments): CastsAttributes
     {
         return new class implements CastsAttributes
@@ -4177,4 +4480,26 @@ class EloquentModelBootingCallbackTestStub extends Model
 class EloquentChildModelBootingCallbackTestStub extends EloquentModelBootingCallbackTestStub
 {
     public static bool $bootHasFinished = false;
+}
+
+class StringableCastBuilder implements NativeStringable
+{
+    public $cast = 'int';
+
+    public function __toString()
+    {
+        return $this->cast;
+    }
+}
+
+enum ConnectionName
+{
+    case Foo;
+    case Bar;
+}
+
+enum ConnectionNameBacked: string
+{
+    case Foo = 'Foo';
+    case Bar = 'Bar';
 }
